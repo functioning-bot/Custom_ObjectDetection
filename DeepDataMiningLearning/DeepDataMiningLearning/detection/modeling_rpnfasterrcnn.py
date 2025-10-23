@@ -1100,6 +1100,7 @@ class CustomRCNN(nn.Module):
         trainable_layers=2,
         num_classes=None,
         out_channels=256, #FPN output channel
+        use_bifpn=False,  # NEW: Use BiFPN instead of standard FPN
         # transform parameters
         min_size=800,
         max_size=1333,
@@ -1141,8 +1142,16 @@ class CustomRCNN(nn.Module):
         #It returns a ImageList for the inputs, and a List[Dict[Tensor]] for the targets
 
         #Backbone
-        #self.body, self.fpn = self.create_fpnbackbone(backbone_modulename)
-        self.backbone = MyBackboneWithFPN(backbone_modulename,trainable_layers, out_channels)
+        # Choose backbone based on model type
+        if backbone_modulename.startswith('efficientnet'):
+            from DeepDataMiningLearning.detection.backbone import EfficientNetBackboneWithFPN
+            self.backbone = EfficientNetBackboneWithFPN(
+                backbone_modulename, trainable_layers, out_channels, use_bifpn=use_bifpn
+            )
+        else:
+            # Use ResNet or other backbones with standard FPN
+            self.backbone = MyBackboneWithFPN(backbone_modulename, trainable_layers, out_channels)
+        
         if not hasattr(self.backbone, "out_channels"):
             print("error")
         self.out_channels = self.backbone.out_channels #256

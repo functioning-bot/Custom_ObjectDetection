@@ -216,6 +216,31 @@ def create_detectionmodel(modelname, num_classes=None, nocustomize=False, traina
         else:
             print("Model name not supported")
         model.to(device)
+    elif modelname.startswith('efficientrcnn'):
+        # Format: efficientrcnn_efficientnet_b3 or efficientrcnn_efficientnet_b3_bifpn
+        x = modelname.split("_")
+        if len(x) >= 3 and x[1] == 'efficientnet':
+            # Build backbone name: efficientnet_b3
+            backbonename = f"{x[1]}_{x[2]}"  # efficientnet_b3
+            use_bifpn = 'bifpn' in modelname  # Check if BiFPN is requested
+            
+            print(f"[INFO] Creating EfficientRCNN with backbone={backbonename}, bifpn={use_bifpn}")
+            
+            model = CustomRCNN(
+                backbone_modulename=backbonename,
+                trainable_layers=trainable_layers,
+                num_classes=num_classes,
+                out_channels=256,
+                min_size=800,
+                max_size=1333,
+                use_bifpn=use_bifpn
+            )
+            if ckpt_file:
+                model = load_checkpoint(model, ckpt_file, fp16)
+        else:
+            print(f"Model name not supported: {modelname}")
+            print("Expected format: efficientrcnn_efficientnet_b3 or efficientrcnn_efficientnet_b3_bifpn")
+        model.to(device)
     elif modelname.startswith('yolo'):
         model, preprocess, classes=create_yolomodel(modelname, num_classes, ckpt_file, fp16, device, scale)
         model= freeze_yolomodel(model, freeze=[])
