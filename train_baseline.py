@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Baseline Training Script for Faster R-CNN with ResNet-50 + FPN
+Supports resuming training from checkpoints
 """
 
 import torch
@@ -12,11 +13,14 @@ from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 import json
 import os
+from datetime import datetime
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import random
+import argparse
+import pickle
 
 class COCODataset(Dataset):
     """COCO format dataset loader"""
@@ -24,7 +28,16 @@ class COCODataset(Dataset):
         self.root = root
         self.transforms = transforms
         self.coco = COCO(annotation_file)
-        self.ids = list(sorted(self.coco.imgs.keys()))
+        # Keep only images that have at least one valid annotation (w>0, h>0)
+        all_ids = list(sorted(self.coco.imgs.keys()))
+        valid_ids = []
+        for img_id in all_ids:
+            ann_ids = self.coco.getAnnIds(imgIds=img_id)
+            anns = self.coco.loadAnns(ann_ids)
+            valid_anns = [a for a in anns if a.get('bbox') and a['bbox'][2] > 0 and a['bbox'][3] > 0]
+            if len(valid_anns) > 0:
+                valid_ids.append(img_id)
+        self.ids = valid_ids
         
     def __getitem__(self, index):
         coco = self.coco
@@ -35,29 +48,50 @@ class COCODataset(Dataset):
         # Load image
         img_info = coco.loadImgs(img_id)[0]
         
-        # Handle dataset prefix in filename
+        # Handle dataset prefix in filename robustly (use basename to avoid 'images/images' issues)
         file_name = img_info['file_name']
         dataset_prefix = img_info.get('dataset', '')
+        basename = os.path.basename(file_name)
+
+        candidates = []
         if dataset_prefix:
-            img_path = os.path.join(self.root, 'images', f"{dataset_prefix}_{file_name}")
-        else:
-            img_path = os.path.join(self.root, 'images', file_name)
-        
+            candidates.append(os.path.join(self.root, 'images', f"{dataset_prefix}_{basename}"))
+        # Fallbacks
+        candidates.append(os.path.join(self.root, 'images', basename))
+        candidates.append(os.path.join(self.root, 'images', file_name))
+
+        img_path = None
+        for cand in candidates:
+            if os.path.exists(cand):
+                img_path = cand
+                break
+        if img_path is None:
+            raise FileNotFoundError(f"Image not found. Tried: {candidates}")
+
         img = Image.open(img_path).convert("RGB")
         
         # Get bounding boxes and labels
         boxes = []
         labels = []
+        areas = []
+        crowds = []
         for ann in anns:
             x, y, w, h = ann['bbox']
-            boxes.append([x, y, x+w, y+h])
-            labels.append(ann['category_id'])
+            if w > 0 and h > 0:
+                boxes.append([x, y, x+w, y+h])
+                labels.append(ann['category_id'])
+                areas.append(ann.get('area', w * h))
+                crowds.append(ann.get('iscrowd', 0))
         
+        # Ensure at least one box remains
+        if len(boxes) == 0:
+            raise FileNotFoundError(f"No valid boxes for image_id {img_id} (filtered).")
+
         boxes = torch.as_tensor(boxes, dtype=torch.float32)
         labels = torch.as_tensor(labels, dtype=torch.int64)
         image_id = torch.tensor([img_id])
-        area = torch.as_tensor([ann['area'] for ann in anns], dtype=torch.float32)
-        iscrowd = torch.as_tensor([ann.get('iscrowd', 0) for ann in anns], dtype=torch.int64)
+        area = torch.as_tensor(areas, dtype=torch.float32)
+        iscrowd = torch.as_tensor(crowds, dtype=torch.int64)
         
         target = {}
         target["boxes"] = boxes
@@ -158,21 +192,70 @@ def evaluate(model, data_loader, device, coco_gt):
         return coco_eval.stats[0]  # mAP@0.5:0.95
     else:
         return 0.0
+def load_checkpoint(checkpoint_path, model, optimizer=None, device='cpu'):
+    """Safely load checkpoint with fallback for PyTorch 2.6+ compatibility"""
+    try:
+        # First try with weights_only=True (safer)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except (pickle.UnpicklingError, RuntimeError) as e:
+        print(f"Warning: Could not load with weights_only=True: {e}")
+        print("Trying with weights_only=False (only do this if you trust the source)")
+        # Fall back to weights_only=False if needed
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    # Load model state dict
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        # If it's a direct state dict
+        model.load_state_dict(checkpoint)
+    
+    # Load optimizer state if available
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    # Return epoch and other metadata if available
+    epoch = checkpoint.get('epoch', 0)
+    best_map = checkpoint.get('map', 0.0)
+    
+    return epoch, best_map
+
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Train baseline Faster R-CNN model')
+    parser.add_argument('--resume', type=str, default=None,
+                      help='Path to checkpoint to resume training from')
+    parser.add_argument('--data-path', type=str, 
+                      default='/content/drive/MyDrive/CMPE_Output/merged_dataset',
+                      help='Path to dataset')
+    parser.add_argument('--checkpoint-dir', type=str,
+                      default='/content/drive/MyDrive/CMPE_Output/checkpoints/baseline',
+                      help='Directory to save checkpoints')
+    parser.add_argument('--epochs', type=int, default=9,
+                      help='Number of total epochs to run')
+    parser.add_argument('--batch-size', type=int, default=4,
+                      help='Batch size for training')
+    args = parser.parse_args()
+
     # Configuration
-    DATA_PATH = '/content/drive/MyDrive/CMPE_Dataset/merged_dataset'
+    DATA_PATH = args.data_path
     ANNOTATION_FILE = f'{DATA_PATH}/annotations.json'
     NUM_CLASSES = 5  # 4 classes + background
-    BATCH_SIZE = 4
-    NUM_EPOCHS = 20
+    BATCH_SIZE = args.batch_size
+    NUM_EPOCHS = args.epochs
     LEARNING_RATE = 0.005
     MOMENTUM = 0.9
     WEIGHT_DECAY = 0.0005
-    CHECKPOINT_DIR = '/content/drive/MyDrive/CMPE_Output/checkpoints/baseline'
+    CHECKPOINT_DIR = args.checkpoint_dir
+    RESUME_CHECKPOINT = args.resume
     SUBSET_SIZE = int(os.environ.get('SUBSET_SIZE', '0'))  # 0 means use full dataset
     
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    # Create run-specific checkpoint directory with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = os.path.join(CHECKPOINT_DIR, f'run_{timestamp}')
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {run_dir}")
     
     # Device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -227,13 +310,22 @@ def main():
         optimizer, step_size=5, gamma=0.1
     )
     
+    # Resume from checkpoint if provided
+    start_epoch = 0
+    if RESUME_CHECKPOINT and os.path.exists(RESUME_CHECKPOINT):
+        print(f"Loading checkpoint: {RESUME_CHECKPOINT}")
+        start_epoch, best_map = load_checkpoint(RESUME_CHECKPOINT, model, optimizer, device)
+        print(f"Resuming training from epoch {start_epoch}")
+        if best_map > 0:
+            print(f"Previous best mAP: {best_map:.4f}")
+    
     # Training loop
     print("Starting training...")
     train_losses = []
     val_maps = []
     best_map = 0.0
     
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(start_epoch, NUM_EPOCHS):
         # Train
         train_loss = train_one_epoch(
             model, optimizer, train_loader, device, epoch
@@ -253,21 +345,25 @@ def main():
             # Save best model
             if val_map > best_map:
                 best_map = val_map
+                checkpoint_path = os.path.join(run_dir, 'best_model.pth')
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'map': val_map,
-                }, f'{CHECKPOINT_DIR}/best_model.pth')
-                print(f"✓ Saved best model (mAP: {val_map:.4f})")
+                }, checkpoint_path)
+                print(f"✓ Saved best model (mAP: {val_map:.4f}) to {checkpoint_path}")
         
-        # Save checkpoint
+        # Save checkpoint every 5 epochs
         if (epoch + 1) % 5 == 0:
+            checkpoint_path = os.path.join(run_dir, f'checkpoint_epoch_{epoch}.pth')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-            }, f'{CHECKPOINT_DIR}/checkpoint_epoch_{epoch}.pth')
+                'map': val_map if 'val_map' in locals() else 0.0,
+            }, checkpoint_path)
+            print(f"✓ Saved checkpoint to {checkpoint_path}")
     
     # Final evaluation
     print("\n=== Final Evaluation ===")
@@ -286,7 +382,7 @@ def main():
     plt.grid(True)
     
     plt.subplot(1, 2, 2)
-    eval_epochs = list(range(1, NUM_EPOCHS, 2))
+    eval_epochs = list(range(1, len(val_maps) + 1))
     plt.plot(eval_epochs, val_maps, marker='o')
     plt.title('Validation mAP')
     plt.xlabel('Epoch')
@@ -294,10 +390,11 @@ def main():
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig(f'{CHECKPOINT_DIR}/training_curves.png')
+    plot_path = os.path.join(run_dir, 'training_curves.png')
+    plt.savefig(plot_path)
     plt.show()
     
-    print(f"\n✓ Training complete! Best model saved to: {CHECKPOINT_DIR}/best_model.pth")
+    print(f"\n✓ Training complete! Best model saved to: {os.path.join(run_dir, 'best_model.pth')}")
 
 if __name__ == "__main__":
     main()
