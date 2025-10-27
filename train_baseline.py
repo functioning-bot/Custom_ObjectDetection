@@ -16,6 +16,7 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import random
 
 class COCODataset(Dataset):
     """COCO format dataset loader"""
@@ -169,6 +170,7 @@ def main():
     MOMENTUM = 0.9
     WEIGHT_DECAY = 0.0005
     CHECKPOINT_DIR = '/content/drive/MyDrive/CMPE_Output/checkpoints/baseline'
+    SUBSET_SIZE = int(os.environ.get('SUBSET_SIZE', '0'))  # 0 means use full dataset
     
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
@@ -179,6 +181,14 @@ def main():
     # Load dataset
     print("Loading dataset...")
     dataset = COCODataset(DATA_PATH, ANNOTATION_FILE)
+    
+    # Optional: limit dataset to a small random subset for quick sanity checks
+    if SUBSET_SIZE > 0:
+        k = min(SUBSET_SIZE, len(dataset))
+        random.seed(42)
+        subset_ids = random.sample(dataset.ids, k)
+        dataset.ids = subset_ids
+        print(f"[Subset] Using {len(dataset)} images out of original dataset")
     
     # Split into train/val (80/20)
     train_size = int(0.8 * len(dataset))
